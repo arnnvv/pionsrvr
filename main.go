@@ -31,6 +31,20 @@ var (
 	globalHLSFeeder     *HLSFeeder
 )
 
+func addCORSHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	if err := os.MkdirAll(hlsOutputDirDefault, 0755); err != nil {
 		log.Fatalf("Failed to create HLS output directory %s: %v", hlsOutputDirDefault, err)
@@ -46,8 +60,9 @@ func main() {
 	}
 
 	http.HandleFunc(streamerWsPathDefault, handleStreamerConnections)
+
 	fs := http.FileServer(http.Dir(hlsOutputDirDefault))
-	http.Handle(hlsServePathDefault, http.StripPrefix(hlsServePathDefault, fs))
+	http.Handle(hlsServePathDefault, addCORSHeaders(http.StripPrefix(hlsServePathDefault, fs)))
 
 	log.Printf("Server starting on %s...", serverAddrDefault)
 
@@ -77,7 +92,10 @@ func main() {
 
 	globalHLSFeeder.Stop()
 
-	if err := httpServer.Shutdown(context.TODO()); err != nil {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server shutdown error: %v", err)
 	}
 	log.Println("Server gracefully stopped.")

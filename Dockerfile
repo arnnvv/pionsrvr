@@ -11,8 +11,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -ldflags="-s -w" \
     -o api
 
-FROM gcr.io/distroless/static:nonroot
-COPY --from=builder --chmod=0755 /app/api /home/nonroot/app/api
-USER nonroot:nonroot
+FROM alpine:3.20
+RUN apk add --no-cache ffmpeg
+RUN addgroup -S nonroot && adduser -S nonroot -G nonroot
 WORKDIR /home/nonroot/app
+COPY --from=builder /app/api .
+RUN chown -R nonroot:nonroot /home/nonroot/app
+USER nonroot:nonroot
 ENTRYPOINT ["./api"]
