@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,21 @@ type SDPPayload struct {
 
 type CandidatePayload struct {
 	Candidate webrtc.ICECandidateInit `json:"candidate"`
+}
+
+type DirectSignalPayloadClientToServer struct {
+	SDP       *webrtc.SessionDescription `json:"sdp,omitempty"`
+	Candidate *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
+	ToPeerID  string                     `json:"toPeerID"`
+	ClientID  string                     `json:"clientId,omitempty"`
+}
+
+type PayloadWithFrom struct {
+	SDP        *webrtc.SessionDescription `json:"sdp,omitempty"`
+	Candidate  *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
+	FromPeerID string                     `json:"fromPeerID"`
+	ToPeerID   string                     `json:"toPeerID,omitempty"`
+	ClientID   string                     `json:"clientId,omitempty"`
 }
 
 type PeerConnectionContext struct {
@@ -104,12 +120,15 @@ func NewPeerConnectionContext(ws *websocket.Conn, feeder *HLSFeeder, clientID st
 						pcRef.ICEConnectionState() == webrtc.ICEConnectionStateDisconnected {
 						return
 					}
+
 					err := pcRef.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
 					if err != nil {
-						log.Printf("Peer %s: Error sending PLI for track %d: %v", p.id, track.SSRC(), err)
+						if !p.isContextClosed() && !strings.Contains(err.Error(), "srtp: Subsession not found") && !strings.Contains(err.Error(), "io: read/write on closed pipe") {
+							log.Printf("Peer %s: Error sending PLI for track %d: %v", p.id, track.SSRC(), err)
+						}
 					}
 				case <-p.stopPLIGoroutine:
-					log.Printf("Peer %s: PLI goroutine for track %d stopped via channel.", p.id, track.SSRC())
+					log.Printf("Peer %s: PLI goroutine for track SSRC %d stopped via channel.", p.id, track.SSRC())
 					return
 				}
 			}
@@ -139,9 +158,9 @@ func NewPeerConnectionContext(ws *websocket.Conn, feeder *HLSFeeder, clientID st
 	})
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("Peer %s: ICE Connection State changed to %s", p.id, state.String())
+		log.Printf("Peer %s (HLS): ICE Connection State changed to %s", p.id, state.String())
 		if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateClosed || state == webrtc.ICEConnectionStateDisconnected {
-			log.Printf("Peer %s: ICE disconnected/closed/failed. Closing peer connection context.", p.id)
+			log.Printf("Peer %s (HLS): ICE disconnected/closed/failed. Closing this specific peer connection context.", p.id)
 			p.Close()
 		}
 	})
@@ -150,13 +169,13 @@ func NewPeerConnectionContext(ws *websocket.Conn, feeder *HLSFeeder, clientID st
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	}); err != nil {
 		pc.Close()
-		return nil, fmt.Errorf("add video transceiver: %w", err)
+		return nil, fmt.Errorf("add video transceiver for HLS: %w", err)
 	}
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	}); err != nil {
 		pc.Close()
-		return nil, fmt.Errorf("add audio transceiver: %w", err)
+		return nil, fmt.Errorf("add audio transceiver for HLS: %w", err)
 	}
 
 	return p, nil
@@ -199,7 +218,7 @@ func (p *PeerConnectionContext) HandleMessages() {
 
 		var msg Message
 		if err := json.Unmarshal(rawMsg, &msg); err != nil {
-			log.Printf("Peer %s: Error unmarshalling message: %v", p.id, err)
+			log.Printf("Peer %s: Error unmarshalling message: %v. Raw: %s", p.id, err, string(rawMsg))
 			continue
 		}
 
@@ -208,7 +227,7 @@ func (p *PeerConnectionContext) HandleMessages() {
 		p.mu.Unlock()
 
 		if pcRef == nil && (msg.Type == "offer" || msg.Type == "candidate") {
-			log.Printf("Peer %s: Received %s but PeerConnection is nil (already closed). Ignoring.", p.id, msg.Type)
+			log.Printf("Peer %s: Received HLS '%s' but PeerConnection (for HLS) is nil (already closed). Ignoring.", p.id, msg.Type)
 			continue
 		}
 
@@ -216,10 +235,10 @@ func (p *PeerConnectionContext) HandleMessages() {
 		case "offer":
 			var sdpPayload SDPPayload
 			if err := json.Unmarshal(msg.Payload, &sdpPayload); err != nil {
-				log.Printf("Peer %s: Error unmarshalling offer payload: %v", p.id, err)
+				log.Printf("Peer %s: Error unmarshalling HLS offer payload: %v", p.id, err)
 				continue
 			}
-			log.Printf("Peer %s: Received offer", p.id)
+			log.Printf("Peer %s: Received HLS offer", p.id)
 
 			p.mu.Lock()
 			pendingCandidatesRef := make([]*webrtc.ICECandidateInit, len(p.pendingCandidates))
@@ -228,45 +247,45 @@ func (p *PeerConnectionContext) HandleMessages() {
 			p.mu.Unlock()
 
 			if err := pcRef.SetRemoteDescription(sdpPayload.SDP); err != nil {
-				log.Printf("Peer %s: Error setting remote description: %v", p.id, err)
+				log.Printf("Peer %s: Error setting HLS remote description: %v", p.id, err)
 				continue
 			}
 
 			answer, err := pcRef.CreateAnswer(nil)
 			if err != nil {
-				log.Printf("Peer %s: Error creating answer: %v", p.id, err)
+				log.Printf("Peer %s: Error creating HLS answer: %v", p.id, err)
 				continue
 			}
 
 			if err := pcRef.SetLocalDescription(answer); err != nil {
-				log.Printf("Peer %s: Error setting local description: %v", p.id, err)
+				log.Printf("Peer %s: Error setting HLS local description: %v", p.id, err)
 				continue
 			}
 
 			for _, candInit := range pendingCandidatesRef {
 				if err := pcRef.AddICECandidate(*candInit); err != nil {
-					log.Printf("Peer %s: Error adding pending ICE candidate: %v", p.id, err)
+					log.Printf("Peer %s: Error adding pending HLS ICE candidate: %v", p.id, err)
 				} else {
-					log.Printf("Peer %s: Added pending ICE candidate: %s", p.id, candInit.Candidate)
+					log.Printf("Peer %s: Added pending HLS ICE candidate: %s", p.id, candInit.Candidate)
 				}
 			}
 
 			answerPayload, _ := json.Marshal(SDPPayload{SDP: answer})
 			p.sendMessage(Message{Type: "answer", Payload: answerPayload})
-			log.Printf("Peer %s: Sent answer", p.id)
+			log.Printf("Peer %s: Sent HLS answer", p.id)
 
 		case "candidate":
 			var candidatePayload CandidatePayload
 			if err := json.Unmarshal(msg.Payload, &candidatePayload); err != nil {
-				log.Printf("Peer %s: Error unmarshalling candidate payload: %v", p.id, err)
+				log.Printf("Peer %s: Error unmarshalling HLS candidate payload: %v", p.id, err)
 				continue
 			}
-			log.Printf("Peer %s: Received ICE candidate: %s", p.id, candidatePayload.Candidate.Candidate)
+			log.Printf("Peer %s: Received HLS ICE candidate: %s", p.id, candidatePayload.Candidate.Candidate)
 
 			p.mu.Lock()
 			currentPCRef := p.pc
 			if currentPCRef != nil && currentPCRef.RemoteDescription() == nil {
-				log.Printf("Peer %s: Remote description not set. Queuing candidate.", p.id)
+				log.Printf("Peer %s: HLS Remote description not set. Queuing HLS candidate.", p.id)
 				p.pendingCandidates = append(p.pendingCandidates, &candidatePayload.Candidate)
 				p.mu.Unlock()
 				continue
@@ -274,12 +293,12 @@ func (p *PeerConnectionContext) HandleMessages() {
 			p.mu.Unlock()
 
 			if currentPCRef == nil {
-				log.Printf("Peer %s: Received candidate but PeerConnection is nil after lock release. Ignoring.", p.id)
+				log.Printf("Peer %s: Received HLS candidate but PeerConnection is nil after lock release. Ignoring.", p.id)
 				continue
 			}
 
 			if err := currentPCRef.AddICECandidate(candidatePayload.Candidate); err != nil {
-				log.Printf("Peer %s: Error adding ICE candidate: %v", p.id, err)
+				log.Printf("Peer %s: Error adding HLS ICE candidate: %v", p.id, err)
 			}
 
 		case "signal-initiate-p2p", "direct-offer", "direct-answer", "direct-candidate":
@@ -292,54 +311,72 @@ func (p *PeerConnectionContext) HandleMessages() {
 }
 
 func (p *PeerConnectionContext) routeP2PMessage(msg Message) {
-	var genericPayload map[string]any
-	if err := json.Unmarshal(msg.Payload, &genericPayload); err != nil {
-		log.Printf("Peer %s: Error unmarshalling P2P payload for type %s: %v", p.id, msg.Type, err)
+	var clientPayload DirectSignalPayloadClientToServer
+	if err := json.Unmarshal(msg.Payload, &clientPayload); err != nil {
+		log.Printf("Peer %s: Error unmarshalling P2P client payload for type %s: %v. Raw: %s", p.id, msg.Type, err, string(msg.Payload))
 		return
 	}
 
-	genericPayload["fromPeerID"] = p.id
-
-	var toPeerID string
-	if msg.Type != "signal-initiate-p2p" {
-		idVal, ok := genericPayload["toPeerID"].(string)
-		if !ok || idVal == "" {
-			log.Printf("Peer %s: P2P message type %s missing or empty toPeerID", p.id, msg.Type)
-			return
-		}
-		toPeerID = idVal
+	relayPayload := PayloadWithFrom{
+		SDP:        clientPayload.SDP,
+		Candidate:  clientPayload.Candidate,
+		FromPeerID: p.id,
+		ToPeerID:   clientPayload.ToPeerID,
+		ClientID:   clientPayload.ClientID,
 	}
 
-	modifiedPayload, err := json.Marshal(genericPayload)
+	marshaledRelayPayload, err := json.Marshal(relayPayload)
 	if err != nil {
-		log.Printf("Peer %s: Error marshalling modified P2P payload: %v", p.id, err)
+		log.Printf("Peer %s: Error marshalling P2P relay payload for type %s: %v", p.id, msg.Type, err)
 		return
 	}
-	relayMsg := Message{Type: msg.Type, Payload: modifiedPayload}
+	messageToRelay := Message{Type: msg.Type, Payload: marshaledRelayPayload}
 
 	streamerLock.RLock()
 	defer streamerLock.RUnlock()
 
-	foundTarget := false
-	for _, peerCtx := range streamerConnections {
-		if peerCtx.GetID() == p.id && msg.Type == "signal-initiate-p2p" {
-			continue
+	if msg.Type == "signal-initiate-p2p" {
+		announcerID := p.id
+		log.Printf("Peer %s is announcing 'signal-initiate-p2p'. Broadcasting to others and informing announcer about existing peers.", announcerID)
+
+		for _, existingPeerCtx := range streamerConnections {
+			if existingPeerCtx.GetID() == announcerID {
+				continue
+			}
+
+			log.Printf("Peer %s (announcer) signaling 'signal-initiate-p2p' to existing peer %s", announcerID, existingPeerCtx.GetID())
+			existingPeerCtx.sendMessage(messageToRelay)
+
+			payloadForAnnouncer := PayloadWithFrom{FromPeerID: existingPeerCtx.GetID()}
+			marshaledPayloadForAnnouncer, mErr := json.Marshal(payloadForAnnouncer)
+			if mErr != nil {
+				log.Printf("Error marshalling 'signal-initiate-p2p' payload for announcer %s about existing peer %s: %v", announcerID, existingPeerCtx.GetID(), mErr)
+				continue
+			}
+			msgForAnnouncer := Message{Type: "signal-initiate-p2p", Payload: marshaledPayloadForAnnouncer}
+
+			log.Printf("Existing peer %s signaling 'signal-initiate-p2p' back to new peer %s (announcer)", existingPeerCtx.GetID(), announcerID)
+			p.sendMessage(msgForAnnouncer)
+		}
+	} else {
+		targetPeerID := clientPayload.ToPeerID
+		if targetPeerID == "" {
+			log.Printf("Peer %s: P2P message type %s is missing 'toPeerID' in payload.", p.id, msg.Type)
+			return
 		}
 
-		if msg.Type == "signal-initiate-p2p" {
-			peerCtx.sendMessage(relayMsg)
-		} else {
-			if peerCtx.GetID() == toPeerID {
-				log.Printf("Peer %s routing %s to %s", p.id, msg.Type, toPeerID)
-				peerCtx.sendMessage(relayMsg)
+		foundTarget := false
+		for _, targetCtx := range streamerConnections {
+			if targetCtx.GetID() == targetPeerID {
+				log.Printf("Peer %s routing P2P message '%s' (from %s) to target peer %s", p.id, msg.Type, relayPayload.FromPeerID, targetPeerID)
+				targetCtx.sendMessage(messageToRelay)
 				foundTarget = true
 				break
 			}
 		}
-	}
-
-	if msg.Type != "signal-initiate-p2p" && !foundTarget {
-		log.Printf("Peer %s: Target peer %s for %s not found.", p.id, toPeerID, msg.Type)
+		if !foundTarget {
+			log.Printf("Peer %s: Target peer %s for P2P message type '%s' not found.", p.id, targetPeerID, msg.Type)
+		}
 	}
 }
 
@@ -350,11 +387,12 @@ func (p *PeerConnectionContext) sendMessage(msg Message) {
 	p.mu.Unlock()
 
 	if isCtxClosed || wsRef == nil {
+		log.Printf("Peer %s: Attempted to send message type '%s' but WebSocket or context is closed.", p.id, msg.Type)
 		return
 	}
 
 	if err := wsRef.WriteJSON(msg); err != nil {
-		log.Printf("Peer %s: Error writing JSON to WebSocket: %v", p.id, err)
+		log.Printf("Peer %s: Error writing JSON (type: %s) to WebSocket: %v", p.id, msg.Type, err)
 		go p.Close()
 	}
 }
@@ -368,15 +406,22 @@ func (p *PeerConnectionContext) Close() {
 	p.isClosed = true
 	log.Printf("Peer %s: Closing PeerConnectionContext...", p.id)
 
-	if p.stopPLIGoroutine != nil {
-		close(p.stopPLIGoroutine)
-	}
-
 	pcRef := p.pc
 	wsRef := p.ws
+	stopPLIGoCh := p.stopPLIGoroutine
+
 	p.pc = nil
 	p.ws = nil
+	p.stopPLIGoroutine = nil
 	p.mu.Unlock()
+
+	if stopPLIGoCh != nil {
+		select {
+		case <-stopPLIGoCh:
+		default:
+			close(stopPLIGoCh)
+		}
+	}
 
 	if p.hlsFeeder != nil {
 		p.hlsFeeder.RemoveTracksByPeer(p.id)
@@ -384,7 +429,7 @@ func (p *PeerConnectionContext) Close() {
 
 	if pcRef != nil {
 		if err := pcRef.Close(); err != nil {
-			log.Printf("Peer %s: Error closing PeerConnection: %v", p.id, err)
+			log.Printf("Peer %s: Error closing HLS PeerConnection: %v", p.id, err)
 		}
 	}
 
