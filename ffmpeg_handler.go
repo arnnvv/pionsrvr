@@ -23,6 +23,8 @@ const (
 	ffmpegRestartDelay       = 3 * time.Second
 	ffmpegOutputCleanupDelay = 1 * time.Second
 	ffmpegStopTimeout        = 5 * time.Second
+	rtpForwarderReadTimeout  = 5 * time.Second
+	rtpForwarderInitialDelay = 1 * time.Second
 )
 
 type RTPForwarder struct {
@@ -40,7 +42,7 @@ func NewRTPForwarder(track *webrtc.TrackRemote, peerID string, rtpPort int) (*RT
 	if err != nil {
 		return nil, fmt.Errorf("dial UDP for RTP forward to %s for peer %s track %s: %w", destAddr, peerID, track.ID(), err)
 	}
-	log.Printf("Peer %s: RTPForwarder created for track %s (%s) to %s", peerID, track.ID(), track.Codec().MimeType, destAddr)
+	log.Printf("Peer %s: RTPForwarder created for track %s (%s, SSRC: %d) to %s", peerID, track.ID(), track.Codec().MimeType, track.SSRC(), destAddr)
 
 	return &RTPForwarder{
 		track:    track,
@@ -55,29 +57,107 @@ func (f *RTPForwarder) Start() {
 	f.wg.Add(1)
 	go func() {
 		defer f.wg.Done()
-		defer f.conn.Close()
-		b := make([]byte, rtpBufferSizeDefault)
+		defer func() {
+			log.Printf("Peer %s: Closing UDP connection for track %s (SSRC: %d) to port %d", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort)
+			if f.conn != nil {
+				f.conn.Close()
+			}
+		}()
 
-		log.Printf("Peer %s: Started RTP forwarder for track %s (%s) to port %d", f.peerID, f.track.ID(), f.track.Codec().MimeType, f.rtpPort)
-		for {
-			select {
-			case <-f.stopChan:
-				log.Printf("Peer %s: Stopping RTP forwarder for track %s to port %d", f.peerID, f.track.ID(), f.rtpPort)
-				return
-			default:
-				n, _, err := f.track.Read(b)
-				if err != nil {
-					if err == io.EOF {
-						log.Printf("Peer %s: Track %s ended (EOF)", f.peerID, f.track.ID())
-					} else if !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "RTPReceiver already closed") {
-						log.Printf("Peer %s: Error reading from track %s: %v", f.peerID, f.track.ID(), err)
+		log.Printf("Peer %s: RTPForwarder for track %s (SSRC: %d, port %d) DELAYING start by %s to allow FFmpeg to initialize.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, rtpForwarderInitialDelay)
+
+		select {
+		case <-time.After(rtpForwarderInitialDelay):
+		case <-f.stopChan:
+			log.Printf("Peer %s: RTPForwarder for track %s (SSRC: %d, port %d) stopped during initial delay.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort)
+			return
+		}
+
+		b := make([]byte, rtpBufferSizeDefault)
+		packetsForwarded := 0
+		firstPacketReceived := false
+		log.Printf("Peer %s: Started RTP forwarder (after delay) for track %s (%s, SSRC: %d) to port %d. Waiting for packets...", f.peerID, f.track.ID(), f.track.Codec().MimeType, f.track.SSRC(), f.rtpPort)
+
+		type readResult struct {
+			n   int
+			err error
+		}
+		readCh := make(chan readResult, 1)
+
+		go func() {
+			for {
+				if f.track == nil {
+					select {
+					case readCh <- readResult{0, io.EOF}:
+					case <-f.stopChan:
 					}
 					return
 				}
-				if _, err := f.conn.Write(b[:n]); err != nil {
-					if !strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("Peer %s: Error writing RTP packet to UDP port %d for track %s: %v", f.peerID, f.rtpPort, f.track.ID(), err)
+				n, _, err := f.track.Read(b)
+				select {
+				case readCh <- readResult{n, err}:
+				case <-f.stopChan:
+					log.Printf("Peer %s: RTPForwarder track reader for SSRC %d detected stopChan, exiting reader.", f.peerID, f.track.SSRC())
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		for {
+			select {
+			case <-f.stopChan:
+				log.Printf("Peer %s: Stopping RTP forwarder for track %s (SSRC: %d) to port %d. Forwarded %d packets.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, packetsForwarded)
+				return
+
+			case rr := <-readCh:
+				if rr.err != nil {
+					if rr.err == io.EOF {
+						log.Printf("Peer %s: Track %s (SSRC: %d, port %d) ended (EOF). Forwarded %d packets.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, packetsForwarded)
+					} else if !strings.Contains(rr.err.Error(), "use of closed network connection") &&
+						!strings.Contains(rr.err.Error(), "RTPReceiver already closed") &&
+						!strings.Contains(rr.err.Error(), "io: read/write on closed pipe") &&
+						!strings.Contains(rr.err.Error(), "read udp") {
+						log.Printf("Peer %s: Error reading from track %s (SSRC: %d, port %d): %v. Forwarded %d packets.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, rr.err, packetsForwarded)
 					}
+					return
+				}
+
+				if rr.n > 0 {
+					if !firstPacketReceived {
+						log.Printf("Peer %s: RTPForwarder for track %s (SSRC: %d, port %d) received FIRST packet (%d bytes). Forwarding...", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, rr.n)
+						firstPacketReceived = true
+					}
+					packetsForwarded++
+
+					if f.conn == nil {
+						log.Printf("Peer %s: UDP connection is nil for track %s (SSRC: %d), cannot write packet.", f.peerID, f.track.ID(), f.track.SSRC())
+						continue
+					}
+					_, writeErr := f.conn.Write(b[:rr.n])
+					if writeErr != nil {
+						isConnRefused := false
+						if opError, ok := writeErr.(*net.OpError); ok {
+							if sErr, ok := opError.Err.(*os.SyscallError); ok {
+								if strings.Contains(sErr.Err.Error(), "connection refused") {
+									isConnRefused = true
+								}
+							}
+						}
+
+						if isConnRefused {
+							log.Printf("Peer %s: UDP write to port %d for track %s (SSRC: %d) got 'connection refused'. FFmpeg might not be ready or closed. Packet dropped.", f.peerID, f.rtpPort, f.track.ID(), f.track.SSRC())
+						} else if !strings.Contains(writeErr.Error(), "use of closed network connection") {
+							log.Printf("Peer %s: Error writing RTP packet to UDP port %d for track %s (SSRC: %d): %v", f.peerID, f.rtpPort, f.track.ID(), f.track.SSRC(), writeErr)
+						}
+					}
+				}
+
+			case <-time.After(rtpForwarderReadTimeout):
+				if !firstPacketReceived && f.track != nil {
+					log.Printf("Peer %s: RTPForwarder for track %s (SSRC: %d, port %d) still waiting for first packet...", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort)
 				}
 			}
 		}
@@ -85,9 +165,10 @@ func (f *RTPForwarder) Start() {
 }
 
 func (f *RTPForwarder) Stop() {
+	log.Printf("Peer %s: Initiating stop for RTPForwarder for track %s (SSRC: %d) port %d", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort)
 	close(f.stopChan)
 	f.wg.Wait()
-	log.Printf("Peer %s: RTPForwarder stopped for track %s port %d", f.peerID, f.track.ID(), f.rtpPort)
+	log.Printf("Peer %s: RTPForwarder stopped for track %s (SSRC: %d) port %d", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort)
 }
 
 type HLSFeederSlot struct {
@@ -268,8 +349,7 @@ func (f *HLSFeeder) AddTrack(track *webrtc.TrackRemote, peerID string) error {
 	log.Printf("HLSFeeder: Added %s track from peer %s (ID: %s, Codec: %s, SSRC: %d) to slot (port %d). Total HLS tracks: %d",
 		track.Kind(), peerID, track.ID(), track.Codec().MimeType, track.SSRC(), targetSlot.Port, f.tracksCount)
 
-	currentFFmpegRunning := f.ffmpegRunning
-	currentTracksCount := f.tracksCount
+	ffmpegWasRunning := f.ffmpegRunning
 	f.mu.Unlock()
 
 	forwarder.Start()
@@ -278,18 +358,18 @@ func (f *HLSFeeder) AddTrack(track *webrtc.TrackRemote, peerID string) error {
 		log.Printf("HLSFeeder: Error generating SDP after adding track for peer %s: %v", peerID, err)
 	}
 
-	if !currentFFmpegRunning && currentTracksCount > 0 {
-		log.Printf("HLSFeeder: FFmpeg not running and tracks > 0. Attempting to start FFmpeg.")
-		f.ensureFFmpegRunning()
-	} else if currentFFmpegRunning {
-		log.Println("HLSFeeder: FFmpeg already running. SDP updated. Manual FFmpeg restart might be needed if input sources changed significantly.")
+	if ffmpegWasRunning {
+		log.Println("HLSFeeder: FFmpeg was running and tracks changed (added). Restarting FFmpeg with new SDP.")
+		f.signalStopFFmpeg()
+		f.ffmpegWg.Wait()
 	}
+
+	f.ensureFFmpegRunning()
 	return nil
 }
 
 func (f *HLSFeeder) RemoveTracksByPeer(peerID string) {
 	f.mu.Lock()
-
 	log.Printf("HLSFeeder: Attempting to remove tracks for peer %s.", peerID)
 	removedCount := 0
 	for _, slot := range f.slots {
@@ -305,26 +385,37 @@ func (f *HLSFeeder) RemoveTracksByPeer(peerID string) {
 	if removedCount > 0 {
 		log.Printf("HLSFeeder: Removed %d HLS tracks for peer %s. Total HLS tracks remaining: %d", removedCount, peerID, f.tracksCount)
 
+		currentTracksCount := f.tracksCount
+		ffmpegWasRunning := f.ffmpegRunning
 		f.mu.Unlock()
+
 		if err := f.generateSDP(); err != nil {
 			log.Printf("HLSFeeder: Error generating SDP after removing tracks for peer %s: %v", peerID, err)
 		}
-		f.mu.Lock()
 
-		if f.tracksCount == 0 && f.ffmpegRunning {
-			log.Println("HLSFeeder: All HLS tracks removed and FFmpeg is running. Signaling FFmpeg to stop.")
-			f.signalStopFFmpeg()
-		} else if f.ffmpegRunning {
-			fmt.Printf("HLSFeeder: FFmpeg running. SDP updated after track removal for peer %s. Manual FFmpeg restart might be needed.", peerID)
+		if ffmpegWasRunning {
+			if currentTracksCount == 0 {
+				log.Println("HLSFeeder: All HLS tracks removed. FFmpeg was running. Signaling stop.")
+				f.signalStopFFmpeg()
+			} else {
+				log.Println("HLSFeeder: Tracks remain after removal. FFmpeg was running. Restarting with updated SDP.")
+				f.signalStopFFmpeg()
+				f.ffmpegWg.Wait()
+				f.ensureFFmpegRunning()
+			}
+		} else if currentTracksCount > 0 {
+			log.Println("HLSFeeder: FFmpeg was not running, but tracks exist after removal. Ensuring it runs.")
+			f.ensureFFmpegRunning()
 		}
+	} else {
+		f.mu.Unlock()
 	}
-	f.mu.Unlock()
 }
 
 func (f *HLSFeeder) ensureFFmpegRunning() {
 	f.mu.Lock()
 	if f.ffmpegRunning {
-		log.Printf("HLSFeeder: ensureFFmpegRunning - FFmpeg already running. Tracks: %d", f.tracksCount)
+		log.Printf("HLSFeeder: ensureFFmpegRunning - FFmpeg reported as already running. Tracks: %d", f.tracksCount)
 		f.mu.Unlock()
 		return
 	}
@@ -352,34 +443,35 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 		return
 	}
 
-	log.Println("HLSFeeder: Conditions met to start FFmpeg. Setting ffmpegRunning=true and adding to WaitGroup.")
+	log.Printf("HLSFeeder: ensureFFmpegRunning - Conditions met. Will attempt to start FFmpeg.")
 	f.ffmpegRunning = true
+
 	if f.stopFFmpegCmd != nil {
 		select {
 		case <-f.stopFFmpegCmd:
 		default:
-			close(f.stopFFmpegCmd)
+			log.Printf("HLSFeeder: ensureFFmpegRunning - Previous stopFFmpegCmd was not closed.")
 		}
 	}
 	f.stopFFmpegCmd = make(chan struct{})
+
 	f.ffmpegWg.Add(1)
 
-	err = f.startFFmpegInternal()
-	if err != nil {
-		log.Printf("HLSFeeder: Failed to start FFmpeg process: %v", err)
+	errStart := f.startFFmpegInternal()
+
+	if errStart != nil {
+		log.Printf("HLSFeeder: ensureFFmpegRunning - startFFmpegInternal FAILED: %v", errStart)
 		f.ffmpegRunning = false
 		if f.stopFFmpegCmd != nil {
-			select {
-			case <-f.stopFFmpegCmd:
-			default:
-				close(f.stopFFmpegCmd)
-			}
+			close(f.stopFFmpegCmd)
 			f.stopFFmpegCmd = nil
 		}
 		f.ffmpegWg.Done()
-	} else {
-		log.Println("HLSFeeder: FFmpeg process initiation successful via ensureFFmpegRunning.")
+		f.mu.Unlock()
+		return
 	}
+
+	log.Println("HLSFeeder: ensureFFmpegRunning - FFmpeg process initiation successful via startFFmpegInternal.")
 	f.mu.Unlock()
 }
 
@@ -390,55 +482,62 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 	if err != nil {
 		return fmt.Errorf("internal error: failed to read SDP file %s in startFFmpegInternal: %w", f.ffmpegSDPFile, err)
 	}
+	if len(sdpBytes) == 0 {
+		log.Println("HLSFeeder: SDP file is empty. FFmpeg will not be started.")
+		return nil
+	}
 	log.Printf("HLSFeeder: SDP file content for FFmpeg at start:\n%s", string(sdpBytes))
 
-	activeVideoMappings := []string{}
-	activeAudioMappings := []string{}
-	ffmpegInputIndex := 0
+	ffmpegMapInputsForVideo := []string{}
+	ffmpegMapInputsForAudio := []string{}
+	currentVideoIdx := 0
+	currentAudioIdx := 0
+
 	scanner := bufio.NewScanner(strings.NewReader(string(sdpBytes)))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "m=video") {
-			activeVideoMappings = append(activeVideoMappings, fmt.Sprintf("[%d:v:0]", ffmpegInputIndex))
-			ffmpegInputIndex++
+			ffmpegMapInputsForVideo = append(ffmpegMapInputsForVideo, fmt.Sprintf("0:v:%d", currentVideoIdx))
+			currentVideoIdx++
 		} else if strings.HasPrefix(line, "m=audio") {
-			activeAudioMappings = append(activeAudioMappings, fmt.Sprintf("[%d:a:0]", ffmpegInputIndex))
-			ffmpegInputIndex++
+			ffmpegMapInputsForAudio = append(ffmpegMapInputsForAudio, fmt.Sprintf("0:a:%d", currentAudioIdx))
+			currentAudioIdx++
 		}
 	}
 
-	if len(activeVideoMappings) == 0 && len(activeAudioMappings) == 0 {
-		return fmt.Errorf("internal error: no active video or audio m-lines in SDP for FFmpeg")
+	if len(ffmpegMapInputsForVideo) == 0 && len(ffmpegMapInputsForAudio) == 0 {
+		log.Println("HLSFeeder: No active video or audio m-lines in SDP for FFmpeg. Not starting FFmpeg.")
+		return nil
 	}
-	log.Printf("HLSFeeder: FFmpeg mappings - Video: %v, Audio: %v", activeVideoMappings, activeAudioMappings)
+	log.Printf("HLSFeeder: FFmpeg resolved input mappings - Video: %v, Audio: %v", ffmpegMapInputsForVideo, ffmpegMapInputsForAudio)
 
 	var complexFilter strings.Builder
 	var outputVideoMap, outputAudioMap string
 
-	if len(activeVideoMappings) > 0 {
+	if len(ffmpegMapInputsForVideo) > 0 {
 		outputVideoMap = "[vout]"
-		if len(activeVideoMappings) == 1 {
-			complexFilter.WriteString(fmt.Sprintf("%sscale=640:360,setpts=PTS-STARTPTS%s", activeVideoMappings[0], outputVideoMap))
-		} else if len(activeVideoMappings) >= 2 {
+		if len(ffmpegMapInputsForVideo) == 1 {
+			complexFilter.WriteString(fmt.Sprintf("[%s]scale=640:360,setpts=PTS-STARTPTS%s", ffmpegMapInputsForVideo[0], outputVideoMap))
+		} else if len(ffmpegMapInputsForVideo) >= 2 {
 			complexFilter.WriteString(fmt.Sprintf(
-				"%sscale=320:240,setpts=PTS-STARTPTS[v0];%sscale=320:240,setpts=PTS-STARTPTS[v1];[v0][v1]xstack=inputs=2:layout=0_0|w0_0%s",
-				activeVideoMappings[0], activeVideoMappings[1], outputVideoMap))
-			if len(activeVideoMappings) > 2 {
-				log.Printf("HLSFeeder: More than 2 video tracks (%d), HLS will only show first two combined.", len(activeVideoMappings))
+				"[%s]scale=320:240,setpts=PTS-STARTPTS[v0];[%s]scale=320:240,setpts=PTS-STARTPTS[v1];[v0][v1]xstack=inputs=2:layout=0_0|w0_0%s",
+				ffmpegMapInputsForVideo[0], ffmpegMapInputsForVideo[1], outputVideoMap))
+			if len(ffmpegMapInputsForVideo) > 2 {
+				log.Printf("HLSFeeder: More than 2 video tracks (%d), HLS will only show first two combined.", len(ffmpegMapInputsForVideo))
 			}
 		}
 	}
 
-	if len(activeAudioMappings) > 0 {
+	if len(ffmpegMapInputsForAudio) > 0 {
 		outputAudioMap = "[aout]"
-		if complexFilter.Len() > 0 {
+		if complexFilter.Len() > 0 && len(ffmpegMapInputsForVideo) > 0 {
 			complexFilter.WriteString("; ")
 		}
-		audioInputsStr := ""
-		for _, amap := range activeAudioMappings {
-			audioInputsStr += amap
+		var audioInputsForFilter strings.Builder
+		for _, audioMap := range ffmpegMapInputsForAudio {
+			audioInputsForFilter.WriteString(fmt.Sprintf("[%s]", audioMap))
 		}
-		complexFilter.WriteString(fmt.Sprintf("%samix=inputs=%d:normalize=0%s", audioInputsStr, len(activeAudioMappings), outputAudioMap))
+		complexFilter.WriteString(fmt.Sprintf("%samix=inputs=%d:normalize=0%s", audioInputsForFilter.String(), len(ffmpegMapInputsForAudio), outputAudioMap))
 	}
 
 	if err := os.MkdirAll(f.hlsOutputDir, 0755); err != nil {
@@ -448,8 +547,9 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 	ffmpegArgs := []string{
 		"-protocol_whitelist", "file,udp,rtp",
 		"-nostdin",
-		"-analyzeduration", "5000000",
-		"-probesize", "5000000",
+		"-rw_timeout", "20000000",
+		"-analyzeduration", "15000000",
+		"-probesize", "15000000",
 		"-i", f.ffmpegSDPFile,
 		"-y",
 	}
@@ -461,13 +561,11 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 
 	if outputVideoMap != "" {
 		ffmpegArgs = append(ffmpegArgs, "-map", outputVideoMap)
-		ffmpegArgs = append(ffmpegArgs,
-			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-			"-pix_fmt", "yuv420p", "-r", "25", "-g", "50",
-			"-b:v", "800k", "-maxrate", "1000k", "-bufsize", "1500k",
-		)
-	} else if len(activeVideoMappings) == 1 && complexFilter.Len() == 0 {
-		ffmpegArgs = append(ffmpegArgs, "-map", activeVideoMappings[0])
+	} else if len(ffmpegMapInputsForVideo) > 0 && complexFilter.Len() == 0 {
+		ffmpegArgs = append(ffmpegArgs, "-map", fmt.Sprintf("[%s]", ffmpegMapInputsForVideo[0]))
+		log.Printf("HLSFeeder: Directly mapping video input %s as no complex video filter was generated.", ffmpegMapInputsForVideo[0])
+	}
+	if outputVideoMap != "" || (len(ffmpegMapInputsForVideo) > 0 && complexFilter.Len() == 0) {
 		ffmpegArgs = append(ffmpegArgs,
 			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
 			"-pix_fmt", "yuv420p", "-r", "25", "-g", "50",
@@ -477,21 +575,22 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 
 	if outputAudioMap != "" {
 		ffmpegArgs = append(ffmpegArgs, "-map", outputAudioMap)
-		ffmpegArgs = append(ffmpegArgs,
-			"-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "2",
-		)
-	} else if len(activeAudioMappings) == 1 && complexFilter.Len() == 0 {
-		ffmpegArgs = append(ffmpegArgs, "-map", activeAudioMappings[0])
+	} else if len(ffmpegMapInputsForAudio) > 0 && complexFilter.Len() == 0 {
+		ffmpegArgs = append(ffmpegArgs, "-map", fmt.Sprintf("[%s]", ffmpegMapInputsForAudio[0]))
+		log.Printf("HLSFeeder: Directly mapping audio input %s as no complex audio filter was generated.", ffmpegMapInputsForAudio[0])
+	}
+	if outputAudioMap != "" || (len(ffmpegMapInputsForAudio) > 0 && complexFilter.Len() == 0) {
 		ffmpegArgs = append(ffmpegArgs,
 			"-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "2",
 		)
 	}
 
-	if (outputVideoMap == "" && (len(activeVideoMappings) != 1 || complexFilter.Len() != 0)) &&
-		(outputAudioMap == "" && (len(activeAudioMappings) != 1 || complexFilter.Len() != 0)) {
-		if len(activeVideoMappings) == 0 && len(activeAudioMappings) == 0 {
-			return fmt.Errorf("FFmpeg: no video or audio outputs to map, this is an internal logic error")
-		}
+	hasVideoOutput := outputVideoMap != "" || (len(ffmpegMapInputsForVideo) > 0 && complexFilter.Len() == 0)
+	hasAudioOutput := outputAudioMap != "" || (len(ffmpegMapInputsForAudio) > 0 && complexFilter.Len() == 0)
+
+	if !hasVideoOutput && !hasAudioOutput {
+		log.Println("HLSFeeder: No video or audio streams configured for output to HLS. FFmpeg not started.")
+		return nil
 	}
 
 	ffmpegArgs = append(ffmpegArgs,
@@ -503,21 +602,32 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 		filepath.Join(f.hlsOutputDir, "stream.m3u8"),
 	)
 
-	log.Printf("HLSFeeder: Starting FFmpeg with command: ffmpeg %s", strings.Join(ffmpegArgs, " "))
+	log.Printf("HLSFeeder: Preparing to start FFmpeg with command: ffmpeg %s", strings.Join(ffmpegArgs, " "))
 
 	cmd := exec.Command("ffmpeg", ffmpegArgs...)
 	f.ffmpegCmd = cmd
 	currentStopChan := f.stopFFmpegCmd
 
-	stderrPipe, _ := cmd.StderrPipe()
-	stdoutPipe, _ := cmd.StdoutPipe()
-	go pipeToLog("[FFMPEG Stderr]", stderrPipe)
-	go pipeToLog("[FFMPEG Stdout]", stdoutPipe)
+	stderrPipe, errPipeStderr := cmd.StderrPipe()
+	if errPipeStderr != nil {
+		log.Printf("HLSFeeder: ERROR creating StderrPipe for FFmpeg: %v", errPipeStderr)
+	} else {
+		go pipeToLog("[FFMPEG Stderr]", stderrPipe)
+	}
 
+	stdoutPipe, errPipeStdout := cmd.StdoutPipe()
+	if errPipeStdout != nil {
+		log.Printf("HLSFeeder: ERROR creating StdoutPipe for FFmpeg: %v", errPipeStdout)
+	} else {
+		go pipeToLog("[FFMPEG Stdout]", stdoutPipe)
+	}
+
+	log.Println("HLSFeeder: ATTEMPTING TO START FFMPEG PROCESS NOW...")
 	if err := cmd.Start(); err != nil {
+		log.Printf("HLSFeeder: FAILED TO START FFMPEG PROCESS: %v", err)
 		return fmt.Errorf("failed to start FFmpeg process: %w", err)
 	}
-	log.Println("HLSFeeder: FFmpeg process started successfully.")
+	log.Println("HLSFeeder: FFmpeg process cmd.Start() call SUCCEEDED.")
 
 	go func(monitoredCmd *exec.Cmd, stopSignal <-chan struct{}) {
 		defer func() {
@@ -537,8 +647,6 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 			if f.ffmpegCmd == monitoredCmd {
 				f.ffmpegCmd = nil
 			}
-			if f.stopFFmpegCmd == stopSignal {
-			}
 			f.mu.Unlock()
 
 			if err != nil {
@@ -549,23 +657,48 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 
 			f.mu.Lock()
 			tracksStillExist := f.tracksCount > 0
+			isStopSignaled := false
+			if stopSignal != nil {
+				select {
+				case <-stopSignal:
+					isStopSignaled = true
+				default:
+				}
+			}
 			f.mu.Unlock()
 
-			if tracksStillExist {
-				log.Println("HLSFeeder: FFmpeg exited, but tracks are still active. Attempting restart after delay.")
+			if tracksStillExist && !isStopSignaled {
+				log.Println("HLSFeeder: FFmpeg exited unexpectedly, but tracks are still active. Attempting restart after delay.")
 				time.Sleep(ffmpegRestartDelay)
 				f.ensureFFmpegRunning()
+			} else if isStopSignaled {
+				log.Println("HLSFeeder: FFmpeg exited due to a stop signal, not restarting automatically from monitor.")
+				time.Sleep(ffmpegOutputCleanupDelay)
+				f.cleanupHLSOutputFiles()
 			} else {
-				log.Println("HLSFeeder: FFmpeg exited and no active tracks. Cleaning up HLS output files.")
+				log.Println("HLSFeeder: FFmpeg exited and no active tracks or not signaled to stop. Cleaning up HLS output files.")
 				time.Sleep(ffmpegOutputCleanupDelay)
 				f.cleanupHLSOutputFiles()
 			}
 
 		case <-stopSignal:
-			log.Printf("HLSFeeder: Received signal to stop FFmpeg (PID: %d). Sending interrupt.", monitoredCmd.Process.Pid)
 			if monitoredCmd.Process == nil {
-				log.Println("HLSFeeder: FFmpeg process was nil when stop signal received.")
-			} else if err := monitoredCmd.Process.Signal(os.Interrupt); err != nil {
+				log.Println("HLSFeeder: FFmpeg process was nil when stop signal received for monitored command.")
+				select {
+				case <-processDone:
+				case <-time.After(100 * time.Millisecond):
+				}
+				f.mu.Lock()
+				f.ffmpegRunning = false
+				if f.ffmpegCmd == monitoredCmd {
+					f.ffmpegCmd = nil
+				}
+				f.mu.Unlock()
+				return
+			}
+
+			log.Printf("HLSFeeder: Received signal to stop FFmpeg (PID: %d). Sending interrupt.", monitoredCmd.Process.Pid)
+			if err := monitoredCmd.Process.Signal(os.Interrupt); err != nil {
 				log.Printf("HLSFeeder: Error sending SIGINT to FFmpeg (PID: %d), attempting kill: %v", monitoredCmd.Process.Pid, err)
 				if monitoredCmd.Process != nil {
 					monitoredCmd.Process.Kill()
@@ -615,6 +748,9 @@ func (f *HLSFeeder) cleanupHLSOutputFiles() {
 }
 
 func (f *HLSFeeder) signalStopFFmpeg() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.ffmpegCmd == nil || !f.ffmpegRunning {
 		log.Println("HLSFeeder: signalStopFFmpeg called, but FFmpeg not running or command is nil.")
 		f.ffmpegRunning = false
@@ -625,14 +761,14 @@ func (f *HLSFeeder) signalStopFFmpeg() {
 		log.Println("HLSFeeder: Signaling current FFmpeg process to stop...")
 		select {
 		case <-f.stopFFmpegCmd:
-			log.Println("HLSFeeder: stopFFmpegCmd was already closed.")
+			log.Println("HLSFeeder: stopFFmpegCmd was already closed when signaling stop.")
 		default:
 			close(f.stopFFmpegCmd)
 		}
 	} else {
 		log.Println("HLSFeeder: signalStopFFmpeg: stopFFmpegCmd is nil, FFmpeg might be stopping or in inconsistent state.")
 		if f.ffmpegCmd != nil && f.ffmpegCmd.Process != nil {
-			log.Println("HLSFeeder: Fallback: Attempting to kill FFmpeg process directly.")
+			log.Println("HLSFeeder: Fallback: Attempting to kill FFmpeg process directly via signalStopFFmpeg.")
 			f.ffmpegCmd.Process.Kill()
 		}
 		f.ffmpegRunning = false
@@ -651,17 +787,22 @@ func (f *HLSFeeder) Stop() {
 	}
 	f.tracksCount = 0
 
-	if f.ffmpegRunning {
-		f.signalStopFFmpeg()
-	}
+	ffmpegWasRunning := f.ffmpegRunning
 	f.mu.Unlock()
 
-	log.Println("HLSFeeder: Waiting for FFmpeg process to terminate...")
-	f.ffmpegWg.Wait()
+	if ffmpegWasRunning {
+		f.signalStopFFmpeg()
+		log.Println("HLSFeeder: Waiting for FFmpeg process to terminate...")
+		f.ffmpegWg.Wait()
+	}
 
 	f.cleanupHLSOutputFiles()
-	if _, err := os.Stat(f.hlsOutputDir); !os.IsNotExist(err) {
-		os.Remove(f.ffmpegSDPFile)
+
+	f.mu.Lock()
+	sdpPath := f.ffmpegSDPFile
+	f.mu.Unlock()
+	if _, err := os.Stat(sdpPath); !os.IsNotExist(err) {
+		os.Remove(sdpPath)
 	}
 	log.Println("HLSFeeder: Fully stopped and cleaned up.")
 }
@@ -681,7 +822,7 @@ func pipeToLog(prefix string, pipe io.ReadCloser) {
 		log.Printf("%s %s", prefix, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
+		if err != io.EOF && !strings.Contains(err.Error(), "file already closed") && !strings.Contains(err.Error(), "read/write on closed pipe") {
 			log.Printf("%s Pipe error: %v", prefix, err)
 		}
 	}
