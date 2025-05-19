@@ -137,6 +137,15 @@ func (f *RTPForwarder) Start() {
 						continue
 					}
 					_, writeErr := f.conn.Write(b[:rr.n])
+
+					if packetsForwarded <= 5 || packetsForwarded%100 == 0 {
+						if writeErr == nil {
+							log.Printf("Peer %s: RTPForwarder for track %s (SSRC: %d, port %d) successfully WROTE packet #%d (%d bytes) to UDP.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, packetsForwarded, rr.n)
+						} else {
+							log.Printf("Peer %s: RTPForwarder for track %s (SSRC: %d, port %d) FAILED to write packet #%d to UDP. Error: %v", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort, packetsForwarded, writeErr)
+						}
+					}
+
 					if writeErr != nil {
 						isConnRefused := false
 						if opError, ok := writeErr.(*net.OpError); ok {
@@ -146,11 +155,9 @@ func (f *RTPForwarder) Start() {
 								}
 							}
 						}
-
 						if isConnRefused {
-							log.Printf("Peer %s: UDP write to port %d for track %s (SSRC: %d) got 'connection refused'. FFmpeg might not be ready or closed. Packet dropped.", f.peerID, f.rtpPort, f.track.ID(), f.track.SSRC())
 						} else if !strings.Contains(writeErr.Error(), "use of closed network connection") {
-							log.Printf("Peer %s: Error writing RTP packet to UDP port %d for track %s (SSRC: %d): %v", f.peerID, f.rtpPort, f.track.ID(), f.track.SSRC(), writeErr)
+							log.Printf("Peer %s: Persistent error writing RTP packet to UDP port %d for track %s (SSRC: %d): %v", f.peerID, f.rtpPort, f.track.ID(), f.track.SSRC(), writeErr)
 						}
 					}
 				}
@@ -547,9 +554,9 @@ func (f *HLSFeeder) startFFmpegInternal() error {
 	ffmpegArgs := []string{
 		"-protocol_whitelist", "file,udp,rtp",
 		"-nostdin",
-		"-rw_timeout", "20000000",
-		"-analyzeduration", "15000000",
-		"-probesize", "15000000",
+		"-rw_timeout", "30000000",
+		"-analyzeduration", "25000000",
+		"-probesize", "20000000",
 		"-i", f.ffmpegSDPFile,
 		"-y",
 	}
