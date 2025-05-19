@@ -446,11 +446,11 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 
 	f.mu.Lock()
 	sdpFi, err := os.Stat(f.ffmpegSDPFile)
-	if os.IsNotExist(err) || err != nil || (sdpFi != nil && sdpFi.Size() == 0) {
-		var sdpSize int64 = -1
-		if sdpFi != nil {
-			sdpSize = sdpFi.Size()
-		}
+	var sdpSize int64 = -1
+	if sdpFi != nil {
+		sdpSize = sdpFi.Size()
+	}
+	if os.IsNotExist(err) || err != nil || sdpSize == 0 {
 		log.Printf("HLSFeeder: ensureFFmpegRunning - SDP file issue (path: %s, err: %v, size: %d). FFmpeg will not be started.", f.ffmpegSDPFile, err, sdpSize)
 		f.mu.Unlock()
 		return
@@ -559,11 +559,14 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 
 	ffmpegArgs := []string{
 		"-protocol_whitelist", "file,udp,rtp",
+		"-rtbufsize", "128M",
 		"-nostdin",
 		"-rw_timeout", "30000000",
 		"-analyzeduration", "25000000",
 		"-probesize", "20000000",
-		"-max_delay", "10000000",
+		"-max_delay", "15000000",
+		"-fflags", "+nobuffer",
+		"-fflags", "+ignidx",
 		"-i", f.ffmpegSDPFile,
 		"-y",
 	}
