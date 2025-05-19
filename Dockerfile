@@ -18,4 +18,5 @@ WORKDIR /home/nonroot/app
 COPY --from=builder /app/api .
 RUN chown -R nonroot:nonroot /home/nonroot/app
 USER nonroot:nonroot
+RUN mkdir -p /home/nonroot/hls_output && chmod -R 777 /home/nonroot/hls_output
 ENTRYPOINT ["./api"]

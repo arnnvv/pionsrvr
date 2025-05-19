@@ -558,6 +558,7 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 	}
 
 	ffmpegArgs := []string{
+		"-loglevel", "debug",
 		"-protocol_whitelist", "file,udp,rtp",
 		"-rtbufsize", "128M",
 		"-nostdin",
