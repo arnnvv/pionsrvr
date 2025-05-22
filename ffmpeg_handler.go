@@ -156,6 +156,9 @@ func (f *RTPForwarder) Start() {
 							}
 						}
 						if isConnRefused {
+							if packetsForwarded < 2 {
+								log.Printf("Peer %s: UDP connection refused for track %s (SSRC: %d) to port %d. FFmpeg might not be listening yet.", f.peerID, f.track.ID(), f.track.SSRC(), f.rtpPort)
+							}
 						} else if !strings.Contains(writeErr.Error(), "use of closed network connection") {
 							log.Printf("Peer %s: Persistent error writing RTP packet to UDP port %d for track %s (SSRC: %d): %v", f.peerID, f.rtpPort, f.track.ID(), f.track.SSRC(), writeErr)
 						}
@@ -282,9 +285,17 @@ func (f *HLSFeeder) generateSDP() error {
 			sdpContent.WriteString("\n")
 
 			if slot.IsVideo && codec.MimeType == webrtc.MimeTypeH264 {
-				sdpContent.WriteString(fmt.Sprintf("a=fmtp:%d packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1\n", pt))
+				if codec.SDPFmtpLine != "" {
+					sdpContent.WriteString(fmt.Sprintf("a=fmtp:%d %s\n", pt, codec.SDPFmtpLine))
+				} else {
+					sdpContent.WriteString(fmt.Sprintf("a=fmtp:%d packetization-mode=1\n", pt))
+				}
 			} else if !slot.IsVideo && codec.MimeType == webrtc.MimeTypeOpus {
-				sdpContent.WriteString(fmt.Sprintf("a=fmtp:%d minptime=10;useinbandfec=1\n", pt))
+				if codec.SDPFmtpLine != "" {
+					sdpContent.WriteString(fmt.Sprintf("a=fmtp:%d %s\n", pt, codec.SDPFmtpLine))
+				} else {
+					sdpContent.WriteString(fmt.Sprintf("a=fmtp:%d minptime=10;useinbandfec=1\n", pt))
+				}
 			}
 			sdpContent.WriteString("a=recvonly\n")
 			activeMediaDescriptions++
@@ -293,7 +304,7 @@ func (f *HLSFeeder) generateSDP() error {
 
 	if activeMediaDescriptions == 0 {
 		log.Println("HLSFeeder: No active tracks for SDP. Removing SDP file if it exists.")
-		if _, err := os.Stat(f.hlsOutputDir); !os.IsNotExist(err) {
+		if _, err := os.Stat(f.ffmpegSDPFile); !os.IsNotExist(err) {
 			os.Remove(f.ffmpegSDPFile)
 		}
 		return nil
@@ -311,9 +322,9 @@ func (f *HLSFeeder) AddTrack(track *webrtc.TrackRemote, peerID string) error {
 	f.mu.Lock()
 
 	if f.tracksCount >= maxHLSTracksDefault*2 {
-		log.Printf("HLSFeeder: Max HLS tracks (%d) reached. Ignoring new %s track from peer %s.", maxHLSTracksDefault*2, track.Kind(), peerID)
+		log.Printf("HLSFeeder: Max HLS tracks capacity (%d slots filled by %d tracks) reached. Ignoring new %s track from peer %s.", maxHLSTracksDefault*2, f.tracksCount, track.Kind(), peerID)
 		f.mu.Unlock()
-		return fmt.Errorf("max HLS tracks reached")
+		return fmt.Errorf("max HLS tracks capacity reached")
 	}
 
 	var targetSlot *HLSFeederSlot
@@ -337,7 +348,7 @@ func (f *HLSFeeder) AddTrack(track *webrtc.TrackRemote, peerID string) error {
 	}
 
 	if targetSlot == nil {
-		log.Printf("HLSFeeder: No available HLS slot for %s track from peer %s. Current total HLS tracks: %d.", track.Kind(), peerID, f.tracksCount)
+		log.Printf("HLSFeeder: No available HLS slot for %s track from peer %s (or peer already has this kind). Current total HLS tracks: %d.", track.Kind(), peerID, f.tracksCount)
 		f.mu.Unlock()
 		return fmt.Errorf("no available HLS slot for %s track from peer %s", track.Kind(), peerID)
 	}
@@ -379,6 +390,7 @@ func (f *HLSFeeder) RemoveTracksByPeer(peerID string) {
 	}
 
 	if removedCount == 0 {
+		log.Printf("HLSFeeder: No tracks found for peer %s to remove.", peerID)
 		f.mu.Unlock()
 		return
 	}
@@ -398,29 +410,33 @@ func (f *HLSFeeder) manageFFmpegState() {
 
 	shouldBeRunning := f.tracksCount > 0
 	isCurrentlyRunning := f.ffmpegRunning
+	currentCmdInstance := f.ffmpegCmd
 
+	log.Printf("HLSFeeder: manageFFmpegState - Tracks: %d, FFmpegRunning: %t, ShouldBeRunning: %t", f.tracksCount, isCurrentlyRunning, shouldBeRunning)
 	f.mu.Unlock()
 
 	if isCurrentlyRunning {
 		if !shouldBeRunning {
 			log.Println("HLSFeeder: manageFFmpegState - FFmpeg is running but should stop (no tracks).")
-			f.signalStopFFmpeg()
+			f.signalStopFFmpeg(currentCmdInstance)
 			f.ffmpegWg.Wait()
 			log.Println("HLSFeeder: manageFFmpegState - Old FFmpeg confirmed stopped (no tracks).")
 		} else {
 			log.Println("HLSFeeder: manageFFmpegState - FFmpeg is running and tracks configuration might have changed. Restarting.")
-			f.signalStopFFmpeg()
+			f.signalStopFFmpeg(currentCmdInstance)
 			f.ffmpegWg.Wait()
 			log.Println("HLSFeeder: manageFFmpegState - Old FFmpeg confirmed stopped for restart.")
 			f.ensureFFmpegRunning()
-			return
 		}
-	}
-
-	if shouldBeRunning {
-		f.ensureFFmpegRunning()
 	} else {
-		log.Println("HLSFeeder: manageFFmpegState - FFmpeg is not running and no tracks, nothing to do.")
+		if shouldBeRunning {
+			log.Println("HLSFeeder: manageFFmpegState - FFmpeg is not running but should be (tracks exist). Starting.")
+			f.ensureFFmpegRunning()
+		} else {
+			log.Println("HLSFeeder: manageFFmpegState - FFmpeg is not running and no tracks, nothing to do.")
+			time.Sleep(ffmpegOutputCleanupDelay)
+			f.cleanupHLSOutputFiles()
+		}
 	}
 }
 
@@ -447,11 +463,15 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 	f.mu.Lock()
 	sdpFi, err := os.Stat(f.ffmpegSDPFile)
 	var sdpSize int64 = -1
-	if sdpFi != nil {
+	if err == nil && sdpFi != nil {
 		sdpSize = sdpFi.Size()
 	}
+
 	if os.IsNotExist(err) || err != nil || sdpSize == 0 {
 		log.Printf("HLSFeeder: ensureFFmpegRunning - SDP file issue (path: %s, err: %v, size: %d). FFmpeg will not be started.", f.ffmpegSDPFile, err, sdpSize)
+		if sdpSize == 0 && err == nil {
+			os.Remove(f.ffmpegSDPFile)
+		}
 		f.mu.Unlock()
 		return
 	}
@@ -459,9 +479,9 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 	log.Printf("HLSFeeder: ensureFFmpegRunning - Conditions met. Will attempt to start FFmpeg.")
 	f.ffmpegRunning = true
 
-	f.stopFFmpegCmd = make(chan struct{})
+	currentStopSignalForMonitor := make(chan struct{})
+	f.stopFFmpegCmd = currentStopSignalForMonitor
 	f.ffmpegWg.Add(1)
-	currentStopSignalForMonitor := f.stopFFmpegCmd
 	f.mu.Unlock()
 
 	errStart := f.startFFmpegInternal(currentStopSignalForMonitor)
@@ -476,7 +496,6 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 		default:
 			close(currentStopSignalForMonitor)
 		}
-
 		if f.stopFFmpegCmd == currentStopSignalForMonitor {
 			f.stopFFmpegCmd = nil
 		}
@@ -488,6 +507,9 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 	log.Println("HLSFeeder: ensureFFmpegRunning - FFmpeg process initiation successful via startFFmpegInternal.")
 }
 
+// #############################################################################
+// # START OF MODIFIED SECTION
+// #############################################################################
 func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error {
 	f.cleanupHLSOutputFiles()
 
@@ -501,57 +523,23 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 	}
 	log.Printf("HLSFeeder: SDP file content for FFmpeg at start:\n%s", string(sdpBytes))
 
-	ffmpegMapInputsForVideo := []string{}
-	ffmpegMapInputsForAudio := []string{}
-	currentVideoIdx := 0
-	currentAudioIdx := 0
-
+	hasVideoInSDP := false
+	hasAudioInSDP := false
 	scanner := bufio.NewScanner(strings.NewReader(string(sdpBytes)))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "m=video") {
-			ffmpegMapInputsForVideo = append(ffmpegMapInputsForVideo, fmt.Sprintf("0:v:%d", currentVideoIdx))
-			currentVideoIdx++
+			hasVideoInSDP = true
 		} else if strings.HasPrefix(line, "m=audio") {
-			ffmpegMapInputsForAudio = append(ffmpegMapInputsForAudio, fmt.Sprintf("0:a:%d", currentAudioIdx))
-			currentAudioIdx++
+			hasAudioInSDP = true
 		}
 	}
 
-	if len(ffmpegMapInputsForVideo) == 0 && len(ffmpegMapInputsForAudio) == 0 {
-		log.Println("HLSFeeder: No active video or audio m-lines in SDP for FFmpeg. Not starting FFmpeg.")
+	if !hasVideoInSDP && !hasAudioInSDP {
+		log.Println("HLSFeeder: No active video or audio m-lines found in SDP. FFmpeg not started.")
 		return nil
 	}
-	log.Printf("HLSFeeder: FFmpeg resolved input mappings - Video: %v, Audio: %v", ffmpegMapInputsForVideo, ffmpegMapInputsForAudio)
-
-	var complexFilter strings.Builder
-	var outputVideoMap, outputAudioMap string
-
-	if len(ffmpegMapInputsForVideo) > 0 {
-		outputVideoMap = "[vout]"
-		if len(ffmpegMapInputsForVideo) == 1 {
-			complexFilter.WriteString(fmt.Sprintf("[%s]scale=640:360,setpts=PTS-STARTPTS%s", ffmpegMapInputsForVideo[0], outputVideoMap))
-		} else if len(ffmpegMapInputsForVideo) >= 2 {
-			complexFilter.WriteString(fmt.Sprintf(
-				"[%s]scale=320:240,setpts=PTS-STARTPTS[v0];[%s]scale=320:240,setpts=PTS-STARTPTS[v1];[v0][v1]xstack=inputs=2:layout=0_0|w0_0%s",
-				ffmpegMapInputsForVideo[0], ffmpegMapInputsForVideo[1], outputVideoMap))
-			if len(ffmpegMapInputsForVideo) > 2 {
-				log.Printf("HLSFeeder: More than 2 video tracks (%d), HLS will only show first two combined.", len(ffmpegMapInputsForVideo))
-			}
-		}
-	}
-
-	if len(ffmpegMapInputsForAudio) > 0 {
-		outputAudioMap = "[aout]"
-		if complexFilter.Len() > 0 && len(ffmpegMapInputsForVideo) > 0 {
-			complexFilter.WriteString("; ")
-		}
-		var audioInputsForFilter strings.Builder
-		for _, audioMap := range ffmpegMapInputsForAudio {
-			audioInputsForFilter.WriteString(fmt.Sprintf("[%s]", audioMap))
-		}
-		complexFilter.WriteString(fmt.Sprintf("%samix=inputs=%d:normalize=0%s", audioInputsForFilter.String(), len(ffmpegMapInputsForAudio), outputAudioMap))
-	}
+	log.Printf("HLSFeeder: SDP contains video: %t, audio: %t", hasVideoInSDP, hasAudioInSDP)
 
 	if err := os.MkdirAll(f.hlsOutputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create HLS output directory %s for FFmpeg: %w", f.hlsOutputDir, err)
@@ -560,55 +548,43 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 	ffmpegArgs := []string{
 		"-loglevel", "debug",
 		"-protocol_whitelist", "file,udp,rtp",
-		"-rtbufsize", "128M",
+		"-rtbufsize", "128M", // General RTP input buffer for libavformat
 		"-nostdin",
-		"-rw_timeout", "30000000",
-		"-analyzeduration", "25000000",
-		"-probesize", "20000000",
-		"-max_delay", "15000000",
-		"-fflags", "+nobuffer",
-		"-fflags", "+ignidx",
+
+		// More robust input analysis and handling flags (applied before -i)
+		"-analyzeduration", "25000000", // Analyze up to 25 seconds (microseconds)
+		"-probesize", "20000000", // Probe up to 20MB
+		"-max_delay", "15000000", // Max delay for input stream (15 seconds in microseconds)
+		"-fflags", "+nobuffer", // Attempt to reduce input buffering latency by libavformat
+		"-fflags", "+ignidx", // Ignore index, may help with slightly corrupted streams
+
 		"-i", f.ffmpegSDPFile,
 		"-y",
 	}
 
-	if complexFilter.Len() > 0 {
-		log.Printf("HLSFeeder: Using FFmpeg filter_complex: %s", complexFilter.String())
-		ffmpegArgs = append(ffmpegArgs, "-filter_complex", complexFilter.String())
-	}
-
-	if outputVideoMap != "" {
-		ffmpegArgs = append(ffmpegArgs, "-map", outputVideoMap)
-	} else if len(ffmpegMapInputsForVideo) > 0 && complexFilter.Len() == 0 {
-		ffmpegArgs = append(ffmpegArgs, "-map", fmt.Sprintf("[%s]", ffmpegMapInputsForVideo[0]))
-		log.Printf("HLSFeeder: Directly mapping video input %s as no complex video filter was generated.", ffmpegMapInputsForVideo[0])
-	}
-	if outputVideoMap != "" || (len(ffmpegMapInputsForVideo) > 0 && complexFilter.Len() == 0) {
+	if hasVideoInSDP {
 		ffmpegArgs = append(ffmpegArgs,
-			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-			"-pix_fmt", "yuv420p", "-r", "25", "-g", "50",
-			"-b:v", "800k", "-maxrate", "1000k", "-bufsize", "1500k",
+			"-map", "0:v:0?",
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-tune", "zerolatency",
+			"-pix_fmt", "yuv420p",
+			"-r", "25",
+			"-g", "50",
+			"-b:v", "800k",
+			"-maxrate", "1000k",
+			"-bufsize", "1500k",
 		)
 	}
 
-	if outputAudioMap != "" {
-		ffmpegArgs = append(ffmpegArgs, "-map", outputAudioMap)
-	} else if len(ffmpegMapInputsForAudio) > 0 && complexFilter.Len() == 0 {
-		ffmpegArgs = append(ffmpegArgs, "-map", fmt.Sprintf("[%s]", ffmpegMapInputsForAudio[0]))
-		log.Printf("HLSFeeder: Directly mapping audio input %s as no complex audio filter was generated.", ffmpegMapInputsForAudio[0])
-	}
-	if outputAudioMap != "" || (len(ffmpegMapInputsForAudio) > 0 && complexFilter.Len() == 0) {
+	if hasAudioInSDP {
 		ffmpegArgs = append(ffmpegArgs,
-			"-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "2",
+			"-map", "0:a:0?",
+			"-c:a", "aac",
+			"-b:a", "96k",
+			"-ar", "48000",
+			"-ac", "2",
 		)
-	}
-
-	hasVideoOutput := outputVideoMap != "" || (len(ffmpegMapInputsForVideo) > 0 && complexFilter.Len() == 0)
-	hasAudioOutput := outputAudioMap != "" || (len(ffmpegMapInputsForAudio) > 0 && complexFilter.Len() == 0)
-
-	if !hasVideoOutput && !hasAudioOutput {
-		log.Println("HLSFeeder: No video or audio streams configured for output to HLS. FFmpeg not started.")
-		return nil
 	}
 
 	ffmpegArgs = append(ffmpegArgs,
@@ -650,59 +626,57 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 		f.mu.Unlock()
 		return fmt.Errorf("failed to start FFmpeg process: %w", err)
 	}
-	log.Println("HLSFeeder: FFmpeg process cmd.Start() call SUCCEEDED.")
+	log.Printf("HLSFeeder: FFmpeg process cmd.Start() call SUCCEEDED. PID: %d", cmd.Process.Pid)
 
 	go func(monitoredCmd *exec.Cmd, stopSignal <-chan struct{}) {
+		processDone := make(chan error, 1)
+		go func() { processDone <- monitoredCmd.Wait() }()
+
 		defer func() {
-			log.Println("HLSFeeder: FFmpeg monitoring goroutine exiting, calling f.ffmpegWg.Done()")
-			f.ffmpegWg.Done()
+			log.Printf("HLSFeeder: FFmpeg monitoring goroutine (PID: %d) exiting.", monitoredCmd.Process.Pid)
 			f.mu.Lock()
 			if f.ffmpegCmd == monitoredCmd {
 				f.ffmpegCmd = nil
 			}
 			f.ffmpegRunning = false
 			f.mu.Unlock()
+			f.ffmpegWg.Done()
 		}()
 
-		processDone := make(chan error, 1)
-		go func() {
-			processDone <- monitoredCmd.Wait()
-		}()
+		log.Printf("HLSFeeder: Monitoring FFmpeg process (PID: %d)...", monitoredCmd.Process.Pid)
 
 		select {
 		case err := <-processDone:
-			log.Printf("HLSFeeder: FFmpeg process exited. Error: %v", err)
+			log.Printf("HLSFeeder: FFmpeg process (PID: %d) exited. Error: %v", monitoredCmd.Process.Pid, err)
 
 			f.mu.Lock()
-			tracksStillExist := f.tracksCount > 0
-			isStopSignaled := false
-			if stopSignal != nil {
-				select {
-				case <-stopSignal:
-					isStopSignaled = true
-				default:
-				}
+			isStopSignaledForThisInstance := false
+			select {
+			case <-stopSignal:
+				isStopSignaledForThisInstance = true
+			default:
 			}
+			tracksStillExist := f.tracksCount > 0
 			f.mu.Unlock()
 
-			if tracksStillExist && !isStopSignaled {
-				log.Println("HLSFeeder: FFmpeg exited unexpectedly, but tracks are still active. Attempting restart after delay.")
+			if !isStopSignaledForThisInstance && tracksStillExist {
+				log.Printf("HLSFeeder: FFmpeg (PID: %d) exited unexpectedly, but tracks (%d) still exist. Attempting restart after delay.", monitoredCmd.Process.Pid, f.tracksCount)
 				time.Sleep(ffmpegRestartDelay)
 				f.manageFFmpegState()
-			} else if isStopSignaled {
-				log.Println("HLSFeeder: FFmpeg exited due to a stop signal, not restarting automatically from monitor.")
+			} else if isStopSignaledForThisInstance {
+				log.Printf("HLSFeeder: FFmpeg (PID: %d) exited due to a stop signal. Cleaning up.", monitoredCmd.Process.Pid)
 				time.Sleep(ffmpegOutputCleanupDelay)
 				f.cleanupHLSOutputFiles()
 			} else {
-				log.Println("HLSFeeder: FFmpeg exited and no active tracks or not signaled to stop. Cleaning up HLS output files.")
+				log.Printf("HLSFeeder: FFmpeg (PID: %d) exited (no tracks or not signaled). Cleaning up.", monitoredCmd.Process.Pid)
 				time.Sleep(ffmpegOutputCleanupDelay)
 				f.cleanupHLSOutputFiles()
 			}
 
 		case <-stopSignal:
-			log.Printf("HLSFeeder: Received signal to stop FFmpeg via instanceStopChan.")
+			log.Printf("HLSFeeder: Received stop signal for FFmpeg (PID: %d).", monitoredCmd.Process.Pid)
 			if monitoredCmd.Process == nil {
-				log.Println("HLSFeeder: FFmpeg process was nil when stop signal received for monitored command.")
+				log.Println("HLSFeeder: FFmpeg process was nil when stop signal received.")
 				return
 			}
 
@@ -718,13 +692,14 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 			case err := <-processDone:
 				log.Printf("HLSFeeder: FFmpeg (PID: %d) exited after interrupt signal. Error: %v", monitoredCmd.Process.Pid, err)
 			case <-time.After(ffmpegStopTimeout):
-				log.Printf("HLSFeeder: FFmpeg (PID: %d) did not stop within %s after interrupt, attempting kill again.", monitoredCmd.Process.Pid, ffmpegStopTimeout)
+				log.Printf("HLSFeeder: FFmpeg (PID: %d) did not stop within %s after interrupt. Attempting kill.", monitoredCmd.Process.Pid, ffmpegStopTimeout)
 				if monitoredCmd.Process != nil {
 					monitoredCmd.Process.Kill()
 					<-processDone
+					log.Printf("HLSFeeder: FFmpeg (PID: %d) confirmed killed.", monitoredCmd.Process.Pid)
 				}
 			}
-			log.Println("HLSFeeder: FFmpeg process confirmed stopped via signal.")
+			log.Printf("HLSFeeder: FFmpeg process (PID: %d) confirmed stopped via signal. Cleaning up.", monitoredCmd.Process.Pid)
 			time.Sleep(ffmpegOutputCleanupDelay)
 			f.cleanupHLSOutputFiles()
 		}
@@ -732,6 +707,10 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 
 	return nil
 }
+
+// #############################################################################
+// # END OF MODIFIED SECTION
+// #############################################################################
 
 func (f *HLSFeeder) cleanupHLSOutputFiles() {
 	filesTs, _ := filepath.Glob(filepath.Join(f.hlsOutputDir, "*.ts"))
@@ -745,12 +724,18 @@ func (f *HLSFeeder) cleanupHLSOutputFiles() {
 	log.Printf("HLSFeeder: Cleaned HLS output files in: %s", f.hlsOutputDir)
 }
 
-func (f *HLSFeeder) signalStopFFmpeg() {
+func (f *HLSFeeder) signalStopFFmpeg(cmdToStop *exec.Cmd) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if !f.ffmpegRunning || f.stopFFmpegCmd == nil {
 		log.Println("HLSFeeder: signalStopFFmpeg called, but FFmpeg not considered running or stopFFmpegCmd is nil.")
+		return
+	}
+
+	if cmdToStop != nil && f.ffmpegCmd != cmdToStop {
+		log.Printf("HLSFeeder: signalStopFFmpeg targeted a specific cmd instance (PID %d), but current f.ffmpegCmd is different (PID %d). Not stopping current.",
+			cmdToStop.Process.Pid, f.ffmpegCmd.Process.Pid)
 		return
 	}
 
@@ -777,6 +762,7 @@ func (f *HLSFeeder) Stop() {
 	}
 	f.tracksCount = 0
 	ffmpegWasRunning := f.ffmpegRunning
+	currentCmd := f.ffmpegCmd
 	f.mu.Unlock()
 
 	for _, fw := range forwardersToStop {
@@ -786,10 +772,12 @@ func (f *HLSFeeder) Stop() {
 
 	if ffmpegWasRunning {
 		log.Println("HLSFeeder: Global Stop - FFmpeg was running. Signaling it to stop.")
-		f.signalStopFFmpeg()
+		f.signalStopFFmpeg(currentCmd)
 		log.Println("HLSFeeder: Global Stop - Waiting for FFmpeg process to terminate...")
 		f.ffmpegWg.Wait()
 		log.Println("HLSFeeder: Global Stop - FFmpeg process confirmed terminated.")
+	} else {
+		log.Println("HLSFeeder: Global Stop - FFmpeg was not running.")
 	}
 
 	f.cleanupHLSOutputFiles()
@@ -799,6 +787,7 @@ func (f *HLSFeeder) Stop() {
 	f.mu.Unlock()
 	if _, err := os.Stat(sdpPath); !os.IsNotExist(err) {
 		os.Remove(sdpPath)
+		log.Printf("HLSFeeder: Removed SDP file: %s", sdpPath)
 	}
 	log.Println("HLSFeeder: Fully stopped and cleaned up.")
 }
@@ -807,6 +796,10 @@ func (f *HLSFeeder) Start() error {
 	log.Println("HLSFeeder: Initialized. FFmpeg will start when tracks are added.")
 	if err := os.MkdirAll(f.hlsOutputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create HLS output directory %s on start: %w", f.hlsOutputDir, err)
+	}
+	f.cleanupHLSOutputFiles()
+	if _, err := os.Stat(f.ffmpegSDPFile); !os.IsNotExist(err) {
+		os.Remove(f.ffmpegSDPFile)
 	}
 	return nil
 }
