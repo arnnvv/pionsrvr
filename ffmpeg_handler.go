@@ -507,9 +507,6 @@ func (f *HLSFeeder) ensureFFmpegRunning() {
 	log.Println("HLSFeeder: ensureFFmpegRunning - FFmpeg process initiation successful via startFFmpegInternal.")
 }
 
-// #############################################################################
-// # START OF MODIFIED SECTION
-// #############################################################################
 func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error {
 	f.cleanupHLSOutputFiles()
 
@@ -519,7 +516,7 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 	}
 	if len(sdpBytes) == 0 {
 		log.Println("HLSFeeder: SDP file is empty. FFmpeg will not be started.")
-		return nil
+		return fmt.Errorf("SDP file is empty, FFmpeg not started")
 	}
 	log.Printf("HLSFeeder: SDP file content for FFmpeg at start:\n%s", string(sdpBytes))
 
@@ -537,7 +534,7 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 
 	if !hasVideoInSDP && !hasAudioInSDP {
 		log.Println("HLSFeeder: No active video or audio m-lines found in SDP. FFmpeg not started.")
-		return nil
+		return fmt.Errorf("no active media lines in SDP, FFmpeg not started")
 	}
 	log.Printf("HLSFeeder: SDP contains video: %t, audio: %t", hasVideoInSDP, hasAudioInSDP)
 
@@ -548,16 +545,13 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 	ffmpegArgs := []string{
 		"-loglevel", "debug",
 		"-protocol_whitelist", "file,udp,rtp",
-		"-rtbufsize", "128M", // General RTP input buffer for libavformat
+		"-rtbufsize", "128M",
 		"-nostdin",
-
-		// More robust input analysis and handling flags (applied before -i)
-		"-analyzeduration", "25000000", // Analyze up to 25 seconds (microseconds)
-		"-probesize", "20000000", // Probe up to 20MB
-		"-max_delay", "15000000", // Max delay for input stream (15 seconds in microseconds)
-		"-fflags", "+nobuffer", // Attempt to reduce input buffering latency by libavformat
-		"-fflags", "+ignidx", // Ignore index, may help with slightly corrupted streams
-
+		"-analyzeduration", "25000000",
+		"-probesize", "20000000",
+		"-max_delay", "15000000",
+		"-fflags", "+nobuffer",
+		"-fflags", "+ignidx",
 		"-i", f.ffmpegSDPFile,
 		"-y",
 	}
@@ -622,7 +616,9 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 	if err := cmd.Start(); err != nil {
 		log.Printf("HLSFeeder: FAILED TO START FFMPEG PROCESS: %v", err)
 		f.mu.Lock()
-		f.ffmpegCmd = nil
+		if f.ffmpegCmd == cmd {
+			f.ffmpegCmd = nil
+		}
 		f.mu.Unlock()
 		return fmt.Errorf("failed to start FFmpeg process: %w", err)
 	}
@@ -707,10 +703,6 @@ func (f *HLSFeeder) startFFmpegInternal(instanceStopChan <-chan struct{}) error 
 
 	return nil
 }
-
-// #############################################################################
-// # END OF MODIFIED SECTION
-// #############################################################################
 
 func (f *HLSFeeder) cleanupHLSOutputFiles() {
 	filesTs, _ := filepath.Glob(filepath.Join(f.hlsOutputDir, "*.ts"))
